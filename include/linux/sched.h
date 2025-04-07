@@ -548,12 +548,30 @@ struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
 	struct rb_node			run_node;
+	// Vd = Ve + r / w_i;
+	// deadline， 以deadline为key插入到rbtree
+	// 在update_deadline更新
 	u64				deadline;
+	// se->min_vruntime = min(se->vruntime, se->{left,right}->min_vruntime)
+	// 保存以se为root的子树中最小的vruntime值
 	u64				min_vruntime;
+	// 保存以se为root的子树中最小的min_slice值
 	u64				min_slice;
 
 	struct list_head		group_node;
 	unsigned char			on_rq;
+
+	/*
+	delay dequeue:
+	把進入 sleep 但 lag 仍為負的 se 仍暫時保留在 queue 上。
+	理想上，一直保留到 lag = 0 再將其 dequeued。
+	不過實際上 kernel 不可能費心力追蹤該任務的 lag。
+	取而代之，可以一直等到下次要選取該任務時，若其 eligible 才真正將其從 queue 中剃除
+	*/
+
+	// sched_delayed状态的意义：
+	// se调用了dequeue_entity，由于lag不为0，暂时放在rbtree中，参考dequeue_entity中set_delayed
+	// 标记sched_delayed=true
 	unsigned char			sched_delayed;
 	unsigned char			rel_deadline;
 	unsigned char			custom_slice;
@@ -562,8 +580,20 @@ struct sched_entity {
 	u64				exec_start;
 	u64				sum_exec_runtime;
 	u64				prev_sum_exec_runtime;
+	// vruntime表示se实际运行的虚拟时间
+	// 可以理解为Ve，
+	// 当前时间为t，
+	// S_i(t_0, e) = s_i(t_0, t)
+	// 由公式12：
+	// Ve_k+1 = ve_k + u_k / w_i;    u_k为第k次实际获得的时间片，
+	// 恰好符合update_curr中se->vruntime的计算函数: delta_exec实际运行的时间
+	// curr->vruntime += calc_delta_fair(delta_exec, curr);
 	u64				vruntime;
+	// vlag_i = (V - v_i) 即系统虚拟时间V-vruntime
+	// 在update_entity_lag中更新
 	s64				vlag;
+	// r, 即se reqeust的时间片长度，默认sysctl_sched_base_slice
+	// 对于group se， slice为下属se的最小值
 	u64				slice;
 
 	u64				nr_migrations;

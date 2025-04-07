@@ -655,9 +655,16 @@ struct cfs_rq {
 	unsigned int		h_nr_runnable;     /* SCHED_{NORMAL,BATCH,IDLE} */
 	unsigned int		h_nr_idle; /* SCHED_IDLE */
 
+	// 系统虚拟时间V计算公式：
+	// V = Sum_i(w_i * (v_i - v_0)) / W + v_0
+	// 
+	// avg_vruntime = Sum_i(w_i * (v_i - v_0))
+	// avg_load = W = Sum_i(w_i)
+	// min_vruntime = v_0
 	s64			avg_vruntime;
 	u64			avg_load;
 
+	// v_0
 	u64			min_vruntime;
 #ifdef CONFIG_SCHED_CORE
 	unsigned int		forceidle_seq;

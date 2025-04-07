@@ -3791,6 +3791,7 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 	if (task_on_rq_queued(p)) {
 		update_rq_clock(rq);
 		if (p->se.sched_delayed)
+			// p是delay dequeue状态，被唤醒时，需要带ENQUEUE_DELAYED执行enqueue_task
 			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_DELAYED);
 		if (!task_on_cpu(rq, p)) {
 			/*

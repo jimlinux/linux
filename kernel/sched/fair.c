@@ -554,6 +554,7 @@ static inline bool entity_before(const struct sched_entity *a,
 	return (s64)(a->deadline - b->deadline) < 0;
 }
 
+// v_i - v_0
 static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	return (s64)(se->vruntime - cfs_rq->min_vruntime);
@@ -640,6 +641,8 @@ avg_vruntime_sub(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	cfs_rq->avg_load -= weight;
 }
 
+// cfs_rq->avg_vruntime = Sum_i(w_i * (v_i - v_0))
+// v_0 update了，这里cfs_rq->avg_vruntime相应也要update
 static inline
 void avg_vruntime_update(struct cfs_rq *cfs_rq, s64 delta)
 {
@@ -653,12 +656,33 @@ void avg_vruntime_update(struct cfs_rq *cfs_rq, s64 delta)
  * Specifically: avg_runtime() + 0 must result in entity_eligible() := true
  * For this to be so, the result of this function must have a left bias.
  */
+/*
+ * 作用：计算系统虚拟时间V， V是per cfs_rq
+ *
+ * 由Sum lag_i = 0推导出
+ *       \Sum v_i * w_i   \Sum v_i * w_i
+ *   V = -------------- = --------------
+ *          \Sum w_i            W
+ * 
+ * 由于v_i是单调递增，所以引入v_0避免溢出 =》
+ * 最终计算公式：
+ * V = Sum_i(w_i * (v_i - v_0)) / W + v_0
+ * 
+ * 其中3个部分，用三个变量表示：
+ * avg_vruntime = Sum_i(w_i * (v_i - v_0))
+ * avg_load = W = Sum_i(w_i)
+ * min_vruntime = v_0
+ * =》 代码计算：
+ * V = cfs_rq->avg_vruntime / cfs->avg_load + cfs_rq->min_vruntime
+*/
 u64 avg_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 	s64 avg = cfs_rq->avg_vruntime;
 	long load = cfs_rq->avg_load;
 
+	// curr不计入？需要单独处理
+	// 因为当se被pick到后，会调__dequeue_entity移出红黑树，所以是不计入的；
 	if (curr && curr->on_rq) {
 		unsigned long weight = scale_load_down(curr->load.weight);
 
@@ -692,13 +716,18 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
  *
  * XXX could add max_slice to the augmented data to track this.
  */
+// 
 static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	s64 vlag, limit;
 
 	SCHED_WARN_ON(!se->on_rq);
 
+	// vlag = V - v_i
 	vlag = avg_vruntime(cfs_rq) - se->vruntime;
+	// -r_max < lag < max(r_max, q)
+	// r_max是se发起请求的时间片最大长度，这里取2*se->slice
+	// q取TICK_NSEC，每个tick的纳秒数
 	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
 
 	se->vlag = clamp(vlag, -limit, limit);
@@ -713,14 +742,19 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
  * lag_i >= 0 -> V >= v_i
  *
  *     \Sum (v_i - v)*w_i
- * V = ------------------ + v
+ * V = ------------------ + v   // 参考式30
  *          \Sum w_i
  *
+ * V是系统的虚拟时间，由
+ * 
  * lag_i >= 0 -> \Sum (v_i - v)*w_i >= (v_i - v)*(\Sum w_i)
  *
  * Note: using 'avg_vruntime() > se->vruntime' is inaccurate due
  *       to the loss in precision caused by the division.
  */
+// 判断公式：\Sum_i (v_i - v_0)*w_i >= (v_i - v_0)*(\Sum_i w_i)
+// 为什么不直接判断V >= v_i ？ 也就是avg_vruntime() > se->vruntime。注释说 精度不够
+// 这里v_0 是cfs_rq->min_vruntime
 static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -737,11 +771,13 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 	return avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load;
 }
 
+// 判断se是否eligible
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	return vruntime_eligible(cfs_rq, se->vruntime);
 }
 
+// 更新v_0
 static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
 {
 	u64 min_vruntime = cfs_rq->min_vruntime;
@@ -750,12 +786,16 @@ static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
 	 */
 	s64 delta = (s64)(vruntime - min_vruntime);
 	if (delta > 0) {
+		// 由于cfs_rq->avg_vruntime = Sum_i(w_i * (v_i - v_0))
+		// 式中v_0改变了，所以需要更新cfs_rq->avg_vruntime
 		avg_vruntime_update(cfs_rq, delta);
 		min_vruntime = vruntime;
 	}
 	return min_vruntime;
 }
 
+// 调用者: update_curr, reweight_entity, dequeue_entity
+// = min(curr->vruntime, root_se->min_vruntime)
 static void update_min_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *se = __pick_root_entity(cfs_rq);
@@ -780,6 +820,7 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 	cfs_rq->min_vruntime = __update_min_vruntime(cfs_rq, vruntime);
 }
 
+// 获取cfs-rq的红黑树中的节点里，slice最小的值
 static inline u64 cfs_rq_min_slice(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *root = __pick_root_entity(cfs_rq);
@@ -847,8 +888,10 @@ RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
 /*
  * Enqueue an entity into the rb-tree:
  */
+// 插入红黑树，根据deadline排序，__entity_less
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	// 更新cfs_rq->avg_vruntime和cfs_rq->avg_load
 	avg_vruntime_add(cfs_rq, se);
 	se->min_vruntime = se->vruntime;
 	se->min_slice = se->slice;
@@ -860,6 +903,7 @@ static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
 				  &min_vruntime_cb);
+	// 更新cfs_rq->avg_vruntime和cfs_rq->avg_load
 	avg_vruntime_sub(cfs_rq, se);
 }
 
@@ -873,6 +917,7 @@ struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq)
 	return __node_2_se(root);
 }
 
+// 返回deadline最小的se
 struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
 {
 	struct rb_node *left = rb_first_cached(&cfs_rq->tasks_timeline);
@@ -923,9 +968,15 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	 * Once selected, run a task until it either becomes non-eligible or
 	 * until it gets a new slice. See the HACK in set_next_entity().
 	 */
+	// curr->vlag暂存的是curr在准备运行时的deadline值；参考set_next_entity
+	// 如果相等，说明deadline还没有update，se还没有运行足一个申请的se->slice，参考update_deadline
+	// 此 feature 會讓當下選取的任務一直被執行到 non-eligible 或者取得一個新的 slice，
+	// 期間內不會被其他任務搶占
+	// 除非：被shorter slice se wakeup抢占，curr->vlag会被重置，refer check_preempt_wakeup_fair
 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
 		return curr;
 
+	// 0. leftmost是eligible，那选它最佳
 	/* Pick the leftmost entity if it's eligible */
 	if (se && entity_eligible(cfs_rq, se)) {
 		best = se;
@@ -933,6 +984,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	}
 
 	/* Heap search for the EEVD entity */
+	// 从根节点开始找
 	while (node) {
 		struct rb_node *left = node->rb_left;
 
@@ -940,6 +992,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 		 * Eligible entities in left subtree are always better
 		 * choices, since they have earlier deadlines.
 		 */
+		// 1. 左子树，有eligible的se，那就向左边找，vd肯定小
 		if (left && vruntime_eligible(cfs_rq,
 					__node_2_se(left)->min_vruntime)) {
 			node = left;
@@ -953,11 +1006,13 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 		 * entity, so check the current node since it is the one
 		 * with earliest deadline that might be eligible.
 		 */
+		// 2. 左子树没有eligible的，那看中间这个node，是否eligible，是的话肯定就是best了，退出
 		if (entity_eligible(cfs_rq, se)) {
 			best = se;
 			break;
 		}
 
+		// 3. 左边、中间都没有eligible的，那只能看右边了
 		node = node->rb_right;
 	}
 found:
@@ -1004,6 +1059,10 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
  */
 static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	// vd_i = ve_i + r_i / w_i
+	// ve_i在外面更新，如果r_i / w_i时间片还没有用完，下面这个判断成立；
+	// 不需要发出新的request；
+	// 否则，更新deadline，重新调度。
 	if ((s64)(se->vruntime - se->deadline) < 0)
 		return false;
 
@@ -1018,6 +1077,7 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	/*
 	 * EEVDF: vd_i = ve_i + r_i / w_i
 	 */
+	// se request的时间片已经用完，更新deadline，重新发出request，会重新选择se
 	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
 
 	/*
@@ -1170,6 +1230,7 @@ static inline bool did_preempt_short(struct cfs_rq *cfs_rq, struct sched_entity 
 	return !entity_eligible(cfs_rq, curr);
 }
 
+// 短slice的se可以抢占长slice的se
 static inline bool do_preempt_short(struct cfs_rq *cfs_rq,
 				    struct sched_entity *pse, struct sched_entity *se)
 {
@@ -5183,6 +5244,8 @@ void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
 	}
 }
 
+// 这里主要是计算se->vruntime和se->deadline
+// 后续用来插入到红黑树（se->deadline作为排序）
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -5191,6 +5254,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	if (!se->custom_slice)
 		se->slice = sysctl_sched_base_slice;
+	// vslice = se->vruntime / w
 	vslice = calc_delta_fair(se->slice, se);
 
 	/*
@@ -5206,6 +5270,14 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		unsigned long load;
 
 		lag = se->vlag;
+
+		// vlag校正：
+		// 这里是对于策略1，由于se的加入，V->V'发生变化: V' < V
+		// 对于se加入后的vlag'(注释中用vl'_i) = V' - v_i < vlag，减小
+		// 按照策略1，se离开再加入vlag应该不变，所以下面的逻辑是
+		// 把se->vlag扩大记为vlag，使得vlag被减小后等于原始se->vlag
+		// 然后se->vruntime = vruntime - vlag;
+		// 相应se->vruntime缩小，这样就保证了se离开时和加入后lag不变
 
 		/*
 		 * If we want to place a task and preserve lag, we have to
@@ -5257,7 +5329,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		 *   (W + w_i)*vl'_i = (W + w_i)*vl_i - w_i*vl_i
 		 *                   = W*vl_i
 		 *
-		 *   vl_i = (W + w_i)*vl'_i / W
+		 *   vl_i = (W + w_i)*vl'_i / W   // vlag扩大公式
 		 */
 		load = cfs_rq->avg_load;
 		if (curr && curr->on_rq)
@@ -5269,6 +5341,8 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		lag = div_s64(lag, load);
 	}
 
+	// 由定义: vlag = V - v_i
+	// => v_i = V - vlag
 	se->vruntime = vruntime - lag;
 
 	if (se->rel_deadline) {
@@ -5288,6 +5362,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	/*
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
+	// se->vruntime更新了，这里deadline也要更新
 	se->deadline = se->vruntime + vslice;
 }
 
@@ -5456,6 +5531,8 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 		SCHED_WARN_ON(delay && se->sched_delayed);
 
+		// se非eligible，即lag<0，实际用时超了
+		// 先不从就绪队列移除，只设置flag，on_rq还是1
 		if (sched_feat(DELAY_DEQUEUE) && delay &&
 		    !entity_eligible(cfs_rq, se)) {
 			update_load_avg(cfs_rq, se, 0);
@@ -5534,6 +5611,8 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		 * HACK, stash a copy of deadline at the point of pick in vlag,
 		 * which isn't used until dequeue.
 		 */
+		// 在dequeue前se为curr期间，vlag用不到
+		// 所以这里用se->vlag来暂存se->deadline
 		se->vlag = se->deadline;
 	}
 
@@ -6877,6 +6956,11 @@ static int sched_idle_cpu(int cpu)
 }
 #endif
 
+// 如果没启用DELAY_ZERO，仅是clear_delayed(se)
+// 如果启用:
+// 	1. dequeue se
+// 	2. set vlag = 0
+// 	3. enqueue se
 static void
 requeue_delayed_entity(struct sched_entity *se)
 {
@@ -6890,6 +6974,7 @@ requeue_delayed_entity(struct sched_entity *se)
 	SCHED_WARN_ON(!se->sched_delayed);
 	SCHED_WARN_ON(!se->on_rq);
 
+	// DELAY_ZERO用来对se dequeue再enqueue时，vlag置零
 	if (sched_feat(DELAY_ZERO)) {
 		update_entity_lag(cfs_rq, se);
 		if (se->vlag > 0) {
@@ -6933,6 +7018,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & ENQUEUE_RESTORE))))
 		util_est_enqueue(&rq->cfs, p);
 
+	// 把delay dequeue的se重置状态
 	if (flags & ENQUEUE_DELAYED) {
 		requeue_delayed_entity(se);
 		return;
@@ -6949,8 +7035,11 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (task_new && se->sched_delayed)
 		h_nr_runnable = 0;
 
+	// 从se向上遍历parent，如果!on_rq，则插入enqueue之
 	for_each_sched_entity(se) {
+		// 如果已经在，退出
 		if (se->on_rq) {
+			// 如果是delayed，清掉flag
 			if (se->sched_delayed)
 				requeue_delayed_entity(se);
 			break;
@@ -6983,6 +7072,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		flags = ENQUEUE_WAKEUP;
 	}
 
+	//task group从下向root遍历
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 
@@ -7076,7 +7166,10 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 
+		// dequeue_entity 返回false，表示se要按delay dequeue处理
+		// 这里看到，delay dequeue处理的se，
 		if (!dequeue_entity(cfs_rq, se, flags)) {
+			// 对于delay dequeue的task se，直接返回-1
 			if (p && &p->se == se)
 				return -1;
 
@@ -7095,6 +7188,8 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 			return 0;
 
 		/* Don't dequeue parent if it has other entities besides us */
+		// 如果se dequeue之后，cfs-rq权重为0，则继续向上dequeue它的parent
+		// 否则，退出
 		if (cfs_rq->load.weight) {
 			slice = cfs_rq_min_slice(cfs_rq);
 
@@ -7112,6 +7207,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 		flags &= ~(DEQUEUE_DELAYED | DEQUEUE_SPECIAL);
 	}
 
+	// 接着se，向上到root，更新负载等，
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 
@@ -8803,6 +8899,8 @@ static void check_preempt_wakeup_fair(struct rq *rq, struct task_struct *p, int 
 	 * Note that even if @p does not turn out to be the most eligible
 	 * task at this moment, current's slice protection will be lost.
 	 */
+	// shorter slices 可以抢占 longer slices
+	// 此时重置se->vlag，在pick_eevdf时的保护会lost
 	if (do_preempt_short(cfs_rq, pse, se) && se->vlag == se->deadline)
 		se->vlag = se->deadline + 1;
 
