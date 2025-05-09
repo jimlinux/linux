@@ -661,6 +661,7 @@ struct cfs_rq {
 	// avg_vruntime = Sum_i(w_i * (v_i - v_0))
 	// avg_load = W = Sum_i(w_i)
 	// min_vruntime = v_0
+	// 更新函数： avg_vruntime_add/avg_vruntime_sub
 	s64			avg_vruntime;
 	u64			avg_load;
 

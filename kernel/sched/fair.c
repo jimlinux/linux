@@ -891,10 +891,11 @@ RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
 // 插入红黑树，根据deadline排序，__entity_less
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	// 更新cfs_rq->avg_vruntime和cfs_rq->avg_load
+	// 1. 更新cfs_rq->avg_vruntime和cfs_rq->avg_load
 	avg_vruntime_add(cfs_rq, se);
 	se->min_vruntime = se->vruntime;
 	se->min_slice = se->slice;
+	// 2. 加入红黑树
 	rb_add_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
 				__entity_less, &min_vruntime_cb);
 }
@@ -5244,17 +5245,21 @@ void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
 	}
 }
 
-// 这里主要是计算se->vruntime和se->deadline
-// 后续用来插入到红黑树（se->deadline作为排序）
+// 当se重新加入runq时，原来的lag怎么处理？ 论文给出了2个策略：
+// 1. 保持lag不变 - PLACE_LAG feature
+// 2. lag置0
+// se dequeue时的lag保存在se->vlag中，对于新fork的se，vlag为0
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
+	// V = vruntime 表示se加入之前的系统虚拟时间
 	u64 vslice, vruntime = avg_vruntime(cfs_rq);
 	s64 lag = 0;
 
 	if (!se->custom_slice)
 		se->slice = sysctl_sched_base_slice;
-	// vslice = se->vruntime / w
+	// vslice = r / w
+	// se->slice为se request的时间长度
 	vslice = calc_delta_fair(se->slice, se);
 
 	/*
@@ -5271,7 +5276,8 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 		lag = se->vlag;
 
-		// vlag校正：
+		// 1. vlag校正：
+		// se加入前系统虚拟时间是V，加入之后是V'
 		// 这里是对于策略1，由于se的加入，V->V'发生变化: V' < V
 		// 对于se加入后的vlag'(注释中用vl'_i) = V' - v_i < vlag，减小
 		// 按照策略1，se离开再加入vlag应该不变，所以下面的逻辑是
@@ -5341,8 +5347,11 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		lag = div_s64(lag, load);
 	}
 
-	// 由定义: vlag = V - v_i
-	// => v_i = V - vlag
+	// 2. v_i' = V - vl_i'
+	// 这里V: se加入之前的系统时间 = vruntime
+	// vl_i': 扩大之后的vlag = 下式中的lag
+	// 由于现在系统虚拟时间与se dequeue之前可能过去很久， 我们要保证lag不变
+	// 所以，这里要修改v_i即se->vruntime的值， 使之跟上系统虚拟时间，并且保持他们的差即lag不变。
 	se->vruntime = vruntime - lag;
 
 	if (se->rel_deadline) {
@@ -5362,7 +5371,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	/*
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
-	// se->vruntime更新了，这里deadline也要更新
+	// 3. se->vruntime更新了，这里deadline也要更新
 	se->deadline = se->vruntime + vslice;
 }
 
@@ -5395,6 +5404,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 *     its group cfs_rq
 	 *   - Add its new weight to cfs_rq->load.weight
 	 */
+	// 1. 更新负载
 	update_load_avg(cfs_rq, se, UPDATE_TG | DO_ATTACH);
 	se_update_runnable(se);
 	/*
@@ -5402,15 +5412,18 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * but update_cfs_group() here will re-adjust the weight and have to
 	 * undo/redo all that. Seems wasteful.
 	 */
+	// 2. 更新group se的权重
 	update_cfs_group(se);
 
 	/*
 	 * XXX now that the entity has been re-weighted, and it's lag adjusted,
 	 * we can place the entity.
 	 */
+	// 3. 更新se->vruntime和se->deadline
 	if (!curr)
 		place_entity(cfs_rq, se, flags);
 
+	// 4. 更新cfs_rq的权重，加入se的权重
 	account_entity_enqueue(cfs_rq, se);
 
 	/* Entity has migrated, no longer consider this task hot */
@@ -5419,6 +5432,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
+	// 5. 更新系统虚拟时间，加入红黑树
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;

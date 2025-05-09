@@ -589,8 +589,9 @@ struct sched_entity {
 	// 恰好符合update_curr中se->vruntime的计算函数: delta_exec实际运行的时间
 	// curr->vruntime += calc_delta_fair(delta_exec, curr);
 	u64				vruntime;
-	// vlag_i = (V - v_i) 即系统虚拟时间V-vruntime
+	// vlag_i = (V - v_i) 即系统虚拟时间V - vruntime
 	// 在update_entity_lag中更新
+	// 主要在se dequeue时更新lag，用来在place_entity重新入队时保证lag不变时用；
 	s64				vlag;
 	// r, 即se reqeust的时间片长度，默认sysctl_sched_base_slice
 	// 对于group se， slice为下属se的最小值
