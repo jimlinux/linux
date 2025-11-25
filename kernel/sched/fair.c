@@ -823,6 +823,7 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 // 获取cfs-rq的红黑树中的节点里，slice最小的值
 static inline u64 cfs_rq_min_slice(struct cfs_rq *cfs_rq)
 {
+	// cfs_rq的就绪队列红黑树root->min_slice为当前红黑树里se->slice最小的值；
 	struct sched_entity *root = __pick_root_entity(cfs_rq);
 	struct sched_entity *curr = cfs_rq->curr;
 	u64 min_slice = ~0ULL;
@@ -5523,6 +5524,9 @@ static inline void finish_delayed_dequeue_entity(struct sched_entity *se)
 		se->vlag = 0;
 }
 
+// flags有DEQUEUE_DELAYED: 不管se是否eligible，都dequeue
+// 其他条件下：要check se是否eligible，如果eligible则dequeue
+// 		注意：se之前可能已经是sched_delayed，这次检查eligible，如果eligible则dequeue，如果没有，则继续delay
 static bool
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -5532,6 +5536,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	update_curr(cfs_rq);
 	clear_buddies(cfs_rq, se);
 
+	// DEQUEUE_DELAYED: 把delayed se也dequeue出来
 	if (flags & DEQUEUE_DELAYED) {
 		SCHED_WARN_ON(!se->sched_delayed);
 	} else {
@@ -7181,9 +7186,8 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 		cfs_rq = cfs_rq_of(se);
 
 		// dequeue_entity 返回false，表示se要按delay dequeue处理
-		// 这里看到，delay dequeue处理的se，
 		if (!dequeue_entity(cfs_rq, se, flags)) {
-			// 对于delay dequeue的task se，直接返回-1
+			// 对于not eligible的task se，延迟dequeue，直接退出，并且不再向上层group se dequeue
 			if (p && &p->se == se)
 				return -1;
 
